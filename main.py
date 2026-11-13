@@ -1,4 +1,5 @@
 """Quantile forecaster for Polymarket's "Next CEO of NVIDIA?" event.
+CANDIDATE v3 (round 4, NOT shipped): v2 + trimmed-EWMA volatility.
 
 Reads one case at a time (/input/<id>.in: every market's Yes price per minute
 for the 72h up to a checkpoint) and writes /output/<id>.out with, for each
@@ -12,27 +13,24 @@ Method, per market (stdlib only, deterministic, no network, no model calls):
     prices should sum to ~1; when the sum at the checkpoint is off 1, the
     median of every market drifts proportionally back toward it, linearly
     over the 240 minutes: med(h) = level * (1 + (1-sum)/sum * h/240).
-    (Tested on the six practice cases: this alone cut the mean pinball
-    loss from 0.288 to 0.279. Mean reversion toward a market's own recent
-    mean/median, slope reversal and logit-space modelling were all tested
-    and lost.)
-  - sigma1: trimmed RMS of the 1-minute price changes over the last 1440
-    minutes -- the largest 5% of squared changes are dropped, then the
-    changes are winsorized at +-0.05. Trimming matters: when a market is
-    first listed every price sits near 0.48, then settles near 0.003, and
-    that one launch jump would otherwise dominate any RMS. Floored at
-    0.0003, capped at 0.02, multiplied by 0.6.
+  - sigma1: EXPONENTIALLY-WEIGHTED trimmed RMS of the 1-minute price
+    changes over the last 1440 minutes (half-life 120 min) -- the largest
+    5% of squared changes are dropped first (a launch jump would otherwise
+    dominate any RMS), then changes are winsorized at +-0.05 and weighted
+    by recency. Floored at 0.0003, capped at 0.02, multiplied by 0.6.
+    (v2 used a flat trimmed RMS over the same window; the EWMA version is
+    the only round-4 idea that improved all three validation sets, by
+    ~0.0015 each -- below the 0.003 bar, so this file was NOT shipped.)
   - spread(h) = sigma1 * sqrt(h).
   - quantiles are ASYMMETRIC: realised moves skew down (the book usually
     carries an overround, so prices drift down more often than up), so the
     downside bands are wider: z = -3.0 / -0.9 / 0 / +0.4 / +2.0.
 
-Calibrated on the six practice cases against answers re-fetched from
-Polymarket's public price history (local scorer in /tmp, not shipped):
-mean pinball loss 0.272 vs the shipped v1's 0.288 and the house baseline's
-0.372 on the same scorer (house reports 0.364 for the baseline on its own
-recording). Per case: p00 0.425, p01 0.295, p02 0.364, p03 0.237, p04 0.201,
-p05 0.109. Mature cases (p03-p05, like the final's) average 0.182.
+Local validation (rebuilt round-4 scorer, answers re-fetched from
+Polymarket's public price history):
+  practice (6 cases):  mean 0.2698 vs v2's 0.2715 (mature p03-p05: 0.1807 vs 0.1821)
+  pseudo-checkpoints (10): mean 0.2935 vs v2's 0.2950
+  per practice case: p00 0.415, p01 0.299, p02 0.362, p03 0.237, p04 0.199, p05 0.106
 """
 
 import json
@@ -53,8 +51,10 @@ def _f(name, default):
         return float(default)
 
 
-# --- tuning parameters (defaults = shipped entry) ---
+# --- tuning parameters (defaults = this candidate) ---
 WIN = int(os.environ.get("POLY_WIN", "1440"))          # lookback minutes for diffs
+HALFLIFE = _f("POLY_HALFLIFE", 120.0)                # EWMA half-life in minutes
+TRIM = _f("POLY_TRIM", 0.05)                         # fraction of largest squared diffs dropped
 SIG_FLOOR = _f("POLY_FLOOR", 0.0003)                 # min per-minute sigma
 SIG_CAP = _f("POLY_CAP", 0.02)                       # max per-minute sigma
 SIG_MULT = _f("POLY_MULT", 0.6)                      # global sigma multiplier
@@ -83,7 +83,7 @@ def forecast_market(prices, horizon, sum_drift=0.0):
         level = prices[-1]
     else:
         level = median(prices[-5:])
-    # per-minute volatility from recent diffs, winsorized + trimmed
+    # per-minute volatility: trimmed, exponentially-weighted RMS of recent diffs
     m = min(WIN, n - 1)
     if m < 10:
         sigma1 = 0.0025
@@ -97,8 +97,19 @@ def forecast_market(prices, horizon, sum_drift=0.0):
                 d = -WINSOR
             diffs.append(d)
         sq = sorted(d * d for d in diffs)
-        keep = sq[: max(10, int(0.95 * len(sq)))]
-        sigma1 = math.sqrt(sum(keep) / len(keep))
+        keep_n = max(10, int((1.0 - TRIM) * len(sq)))
+        cut = sq[keep_n - 1]
+        lam = 0.5 ** (1.0 / HALFLIFE)
+        wsum = 0.0
+        acc = 0.0
+        w = 1.0
+        for d in reversed(diffs):
+            if d * d > cut:
+                continue
+            acc += w * d * d
+            wsum += w
+            w *= lam
+        sigma1 = math.sqrt(acc / wsum) if wsum > 0 else 0.0025
         if sigma1 < SIG_FLOOR:
             sigma1 = SIG_FLOOR
         elif sigma1 > SIG_CAP:
